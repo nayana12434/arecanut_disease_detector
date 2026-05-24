@@ -1,50 +1,67 @@
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, redirect, url_for
 import os
-from PIL import Image
 import numpy as np
+from PIL import Image
 from datetime import datetime
+from ai_edge_litert.interpreter import Interpreter
 
 app = Flask(__name__)
 
 UPLOAD_FOLDER = 'static/uploads'
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-# ── Placeholder prediction (replace with real model later) ──
+# ── Load TFLite Model ──
+interpreter = Interpreter(model_path='model/model_unquant.tflite')
+interpreter.allocate_tensors()
+
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+# ── Load Labels ──
+with open('model/labels.txt', 'r') as f:
+    labels = [line.strip().split(' ', 1)[-1] for line in f.readlines()]
+
+# ── Remedy Map ──
+remedies = {
+    "Healthy": {
+        "severity": "None",
+        "remedy": "No action needed. Continue regular monitoring."
+    },
+    "Fruit Rot": {
+        "severity": "Early Stage",
+        "remedy": "Remove affected fruits immediately. Spray Bordeaux mixture 1%. Improve drainage around the tree base."
+    },
+    "Yellow Leaf Disease": {
+        "severity": "Moderate",
+        "remedy": "Apply recommended fertilizers. Remove yellowing leaves. Consult your local agricultural officer."
+    }
+}
+
+# ── Predict Function ──
 def predict_disease(image_path):
-    """
-    Temporary rule-based prediction.
-    Will be replaced with TFLite model.
-    """
     img = Image.open(image_path).convert('RGB')
     img = img.resize((224, 224))
-    img_array = np.array(img) / 255.0
+    img_array = np.array(img, dtype=np.float32) / 255.0
+    img_array = np.expand_dims(img_array, axis=0)
 
-    avg_color = img_array.mean(axis=(0, 1))
-    r, g, b = avg_color
+    interpreter.set_tensor(input_details[0]['index'], img_array)
+    interpreter.invoke()
 
-    if r > 0.5 and g < 0.4:
-        return {
-            "disease": "Fruit Rot",
-            "confidence": "72%",
-            "severity": "Early Stage",
-            "remedy": "Remove affected fruits. Spray Bordeaux mixture 1%. Improve drainage around the tree."
-        }
-    elif g > 0.5 and r > 0.45:
-        return {
-            "disease": "Yellow Leaf Disease",
-            "confidence": "68%",
-            "severity": "Moderate",
-            "remedy": "Apply recommended fertilizers. Remove yellowing leaves. Consult local agri officer."
-        }
-    else:
-        return {
-            "disease": "Healthy",
-            "confidence": "85%",
-            "severity": "None",
-            "remedy": "No action needed. Continue regular monitoring."
-        }
+    output = interpreter.get_tensor(output_details[0]['index'])[0]
+    predicted_index = np.argmax(output)
+    confidence = float(output[predicted_index]) * 100
 
-# ── Store latest sensor data ──
+    disease = labels[predicted_index]
+    info = remedies.get(disease, remedies["Healthy"])
+
+    return {
+        "disease": disease,
+        "confidence": f"{confidence:.1f}%",
+        "severity": info["severity"],
+        "remedy": info["remedy"]
+    }
+
+# ── Sensor Data Store ──
 sensor_data = {
     "temperature": "--",
     "humidity": "--",
@@ -72,7 +89,6 @@ def index():
 
 @app.route('/upload', methods=['POST'])
 def upload():
-    """Receives image from ESP32-CAM or manual upload"""
     if 'image' not in request.files:
         return jsonify({"error": "No image received"}), 400
 
@@ -84,18 +100,14 @@ def upload():
 
     result = predict_disease(filepath)
 
-    # If request is from browser (form), redirect to dashboard
-    # If request is from ESP32-CAM (API), return JSON
     if request.headers.get('X-Requested-From') == 'esp32':
         return jsonify({"status": "success", "result": result}), 200
-    
-    from flask import redirect, url_for
+
     return redirect(url_for('index'))
 
 
 @app.route('/sensor', methods=['POST'])
 def sensor():
-    """Receives sensor data from ESP32"""
     data = request.get_json()
     if data:
         sensor_data['temperature'] = data.get('temperature', '--')
